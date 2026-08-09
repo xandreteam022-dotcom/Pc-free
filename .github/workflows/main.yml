@@ -1,73 +1,57 @@
-name: Windows RDP via ngrok
+name: RDP Persistente
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # Roda a cada 5 horas (antes do limite de 6h)
 
 jobs:
-  build:
+  rdp:
     runs-on: windows-latest
-
+    timeout-minutes: 360  # 6 horas (limite do grátis)
+    
     steps:
-    - name: Download ngrok
-      run: |
-        Invoke-WebRequest -Uri "https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip" -OutFile "ngrok.zip"
-        Expand-Archive -Path "ngrok.zip" -DestinationPath "."
-    
-    - name: Configurar ngrok com token
-      run: .\ngrok.exe authtoken $env:NGROK_AUTH_TOKEN
-      env:
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-    
-    - name: Habilitar RDP
-      run: |
-        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
-    
-    - name: Definir senha do usuário
-      run: net user runneradmin P@ssw0rd!
-    
-    - name: Iniciar túnel ngrok
-      run: .\ngrok.exe tcp 3389 --region usPARSE "<SOURCE>" LR "<input type=\"hidden\" name=\"token\" value=\"" "\"" -> VAR "AT" 
-
-REQUEST POST "https://rdphostings.com/rdp/index.php?rp=/login" 
-  CONTENT "token=<AT>&username=<USER>&password=<PASS>" 
-  CONTENTTYPE "application/x-www-form-urlencoded" 
-  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko" 
-  HEADER "Pragma: no-cache" 
-  HEADER "Accept: */*" 
-
-KEYCHECK 
-  KEYCHAIN Failure OR 
-    KEY "Login Details Incorrect. Please try again." 
-  KEYCHAIN Success OR 
-    KEY "Logout" 
-    KEY "Account Details" 
-    KEY "Your Profile" 
-
-REQUEST GET "https://rdphostings.com/rdp/clientarea.php?action=details" 
-  
-  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko" 
-  HEADER "Pragma: no-cache" 
-  HEADER "Accept: */*" 
-
-PARSE "<SOURCE>" LR "name=\"firstname\" id=\"inputFirstName\" value=\"" "\"" -> VAR "F" 
-
-PARSE "<SOURCE>" LR "name=\"lastname\" id=\"inputLastName\" value=\"" "\"" -> VAR "L" 
-
-FUNCTION Constant "<F> & <L>" -> CAP "FullName" 
-
-REQUEST GET "https://rdphostings.com/rdp/clientarea.php?action=services" 
-  
-  HEADER "User-Agent: Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko" 
-  HEADER "Pragma: no-cache" 
-  HEADER "Accept: */*" 
-
-PARSE "<SOURCE>" LR "<span class=\"badge\">" "</span>                            <i class=\"far fa-circle\"></i>&nbsp;                            <span>Active</span>" CreateEmpty=FALSE -> CAP "Plan" 
-
-KEYCHECK 
-  KEYCHAIN Success OR 
-    KEY "<Plan>" Contains "0" 
-  KEYCHAIN Custom "CUSTOM" OR 
-    KEY "<Plan>" Contains "0" 
-
+      - name: RDP com Persistência
+        run: |
+          # Ativa RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Verifica se usuário já existe (NÃO RECRIA)
+          $userExists = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if (-not $userExists) {
+            $pass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | % {[char]$_})
+            New-LocalUser -Name "RDP" -Password (ConvertTo-SecureString $pass -AsPlainText -Force) -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            echo "SENHA=$pass" >> $env:GITHUB_ENV
+          } else {
+            # Mantém usuário existente
+            echo "Usuário RDP já existe - mantendo configurações"
+          }
+          
+          # Instala Tailscale só se não existir
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile "$env:TEMP\ts.msi"
+            Start-Process msiexec -Wait -ArgumentList "/i `"$env:TEMP\ts.msi`" /quiet"
+          }
+          
+          # Conecta Tailscale (mantém IP)
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=meu-rdp-permanente
+          
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          
+          Write-Host "=== RDP ACESSO ==="
+          Write-Host "IP: $ip (SEMPRE O MESMO!)"
+          Write-Host "Usuário: RDP"
+          if ($env:SENHA) {
+            Write-Host "Senha: $env:SENHA"
+          } else {
+            Write-Host "Senha: (a mesma de antes)"
+          }
+          Write-Host "=================="
+          
+          # Mantém rodando até o limite de 6h
+          $startTime = Get-Date
+          while ((Get-Date) -lt $startTime.AddHours(5.5)) {
+            Write-Host "[$(Get-Date)] RDP Ativo - Conexões mantidas!"
+            Start-Sleep -Seconds 3600
+          }
