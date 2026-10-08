@@ -1,75 +1,122 @@
-name: RDP Ilimitado
+name: Windows RDP
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'  # ← Isso faz reiniciar antes de parar
+    inputs:
+      duration_hours:
+        description: 'Duração em horas (máx 6)'
+        required: false
+        default: '6'
 
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 horas (limite do grátis)
-    
+    timeout-minutes: 355
+
     steps:
-      - name: Configure Core RDP Settings
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+      # ─── 1. RESTAURAR DADOS DA SESSÃO ANTERIOR ───
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Create RDP User
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper = [char[]](65..90)
-              Lower = [char[]](97..122)
-              Number = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+      - name: Restore previous data (artifact)
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          name: rdp-data
+          path: data/
+          workflow: rdp.yml
+          if_no_artifact_found: warn
 
-      - name: Install Tailscale
+      # ─── 2. CONFIGURAR RDP ───
+      - name: Enable RDP
+        shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          # Habilita RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Connect Tailscale
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          # Define senha do usuário runneradmin
+          $pw = ConvertTo-SecureString "P@ssw0rd!2024" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $pw
 
-      - name: Show Credentials and Keep Alive
+          # Cria segundo usuário (opcional, mais estável)
+          $pw2 = ConvertTo-SecureString "Rdp@2024!" -AsPlainText -Force
+          New-LocalUser -Name "rdpuser" -Password $pw2 -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "rdpuser"
+
+          Write-Host "RDP habilitado. User: runneradmin / Pass: P@ssw0rd!2024"
+
+      # ─── 3. TÚNEL NGROK ───
+      - name: Setup ngrok
+        shell: powershell
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Next run in 5 hours"
-              Start-Sleep -Seconds 300
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "ngrok.zip"
+          Expand-Archive -Path "ngrok.zip" -DestinationPath "C:\ngrok"
+          C:\ngrok\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Start ngrok tunnel
+        shell: powershell
+        run: |
+          Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
+          Start-Sleep -Seconds 15
+
+          $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels"
+          $url = $tunnels.tunnels[0].public_url -replace "tcp://", ""
+          Write-Host "════════════════════════════════════════"
+          Write-Host "  HOST: $url"
+          Write-Host "  USER: runneradmin"
+          Write-Host "  PASS: P@ssw0rd!2024"
+          Write-Host "════════════════════════════════════════"
+
+      # ─── 4. MENSAGEM VISÍVEL NO LOG ───
+      - name: Show connection info
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════╗"
+          Write-Host "║         CONEXÃO RDP PRONTA           ║"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║ Use os dados do passo anterior      ║"
+          Write-Host "║ Host: (pegue no log do ngrok)       ║"
+          Write-Host "║ User: runneradmin                   ║"
+          Write-Host "║ Pass: P@ssw0rd!2024                 ║"
+          Write-Host "╚══════════════════════════════════════╝"
+
+      # ─── 5. MANTER VIVO ───
+      - name: Keep alive
+        shell: powershell
+        run: |
+          $hours = [int]"${{ github.event.inputs.duration_hours }}"
+          if ($hours -gt 6) { $hours = 6 }
+          $seconds = $hours * 3600
+          Write-Host "Mantendo sessão viva por $hours hora(s)..."
+          Start-Sleep -Seconds $seconds
+
+      # ─── 6. SALVAR DADOS ───
+      - name: Save data (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-data
+          path: data/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Commit data to repo
+        if: always()
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if (Test-Path "data") {
+            git add data/
+            git diff --staged --quiet
+            if ($LASTEXITCODE -ne 0) {
+              git commit -m "data: update from session $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+              git push
+            } else {
+              Write-Host "Sem mudanças para commitar."
+            }
           }
